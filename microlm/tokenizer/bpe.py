@@ -30,7 +30,16 @@ def train_bpe(input_path, vocab_size, special_tokens) -> tuple[dict[int, bytes],
     else:
         corpus = [text]
 
-    ##3.预分词，统计
+    ##3.预分词，统计（统计每个片段出现了多少次，统计"哪两个字节经常挨着"）
+    # 优先级	正则片段	匹配内容	例子
+    # 1	'(?:[sdmt]|ll|ve|re)	撇号开头的缩写后缀	's 'd 'm 't 'll 've 're
+    # 2	?\p{L}+	一个可选空格 + 连续字母	Hello 你好 café
+    # 3	?\p{N}+	一个可选空格 + 连续数字	123 2024
+    # 4	?[^\s\p{L}\p{N}]+	一个可选空格 + 连续标点符号	!!! ... @#$
+    # 5	\s+(?!\S)	行尾空白（后面没有非空字符）	行末的空格/Tab
+    # 6	\s+	其他空白字符	单词之间的空格、换行
+    # \p{L} 是 Unicode 属性，匹配任何语言的字母（中文、日文、阿拉伯文、英文等），\p{N} 匹配数字。
+    # GPT-2 BPE 中文整句连续汉字作为整体，直接让BPE处理。 中文分词器会根据词典切分。
     gpt2_pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
     raw_counts = Counter()
     for corpu in corpus:
