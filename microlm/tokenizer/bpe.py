@@ -3,19 +3,18 @@ from collections import defaultdict, Counter
 import regex as re  # type: ignore
 import json
 
-'''
-bpe:
- input_path: str
- vocab_size: int
- special_tokens: list[str]
- ->vocab: dict[int, bytes], 
- merge: list[tupe[bytes,bytes]]
+"""BPE（Byte Pair Encoding）分词器训练模块。
 
-
-save  +  bytes to unicode
-'''
+提供 BPE 词表的完整训练流程：从单字节初始化、预分词、频次统计、
+迭代合并到最终词表生成，以及词表文件的保存。
+"""
 
 def train_bpe(input_path, vocab_size, special_tokens) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """训练 BPE 分词器，返回词表和合并规则。
+
+    从 256 个单字节 token 出发，按 GPT-2 正则预分词后统计相邻 token 对频次，
+    反复合并最高频 pair 直到达到目标词表大小。特殊符号不会被拆分。
+    """
 
     ##1.初始化词表
     vocab = {b:bytes([b]) for b in range(256)}
@@ -31,7 +30,7 @@ def train_bpe(input_path, vocab_size, special_tokens) -> tuple[dict[int, bytes],
     else:
         corpus = [text]
 
-    ##3.预分词
+    ##3.预分词，统计
     gpt2_pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
     raw_counts = Counter()
     for corpu in corpus:
@@ -101,9 +100,10 @@ def train_bpe(input_path, vocab_size, special_tokens) -> tuple[dict[int, bytes],
     return vocab,merge
 
 def bytes_to_unicode():
-    """
-    创建一个映射，将 0-255 字节映射为一组可见的 Unicode 字符。
-    这是 GPT-2 源码中的标准做法。
+    """将 0-255 字节映射为可见 Unicode 字符，用于保存词表文件时保证可读性。
+
+    可打印字符（如字母、数字）映射到自身，控制字符等不可见字节
+    映射到高区 Unicode 码点（chr(256+)）。这是 GPT-2 的标准做法。
     """
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
     cs = bs[:]
@@ -118,6 +118,11 @@ def bytes_to_unicode():
     return dict(zip(bs,cs))
 
 def save_tokenizer_files(vocab, merges, out_dir):
+    """将训练好的词表和合并规则保存到磁盘。
+
+    输出两个文件：vocab.json（词表，token ID → 可见字符映射后的字符串）
+    和 merge.txt（合并规则，每行一条，格式为"左token 右token"）。
+    """
     os.makedirs(out_dir, exist_ok=True)
     bytes_encoder = bytes_to_unicode()
     json_vocab ={

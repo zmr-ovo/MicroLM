@@ -1,3 +1,15 @@
+"""将 JSONL 语料转换为预训练数据。
+
+读取每行为 {"text": "..."} 格式的 JSONL 文件，经过可配置的清洗管线，生成训练集
+和验证集文本文件。支持控制字符去除、HTML 标签清理、空白压缩、长度过滤、字面量
+替换规则以及精确去重。输出带文档分隔符的训练/验证集、分词器训练语料，以及包含
+完整统计信息的 metadata JSON，确保数据处理过程可复现。
+
+用法示例：
+    python prepare_pretrain_jsonl.py --input-path data/raw.jsonl \
+        --output-dir data/pretrain --min-length 50 --clean-html
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,86 +22,104 @@ from pathlib import Path
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器。
+
+    定义所有 CLI 参数，包括输入输出路径、数据集划分比例、文档分隔符、
+    字面量替换规则以及清洗/过滤相关配置。
+    """
     parser = argparse.ArgumentParser(
-        description="Convert line-delimited {'text': ...} corpora into train/valid text files with enhanced cleaning."
+        description="将逐行 {'text': ...} 格式的 JSONL 语料转换为训练/验证集文本文件，支持增强数据清洗。"
     )
     parser.add_argument(
         "--input-path",
         type=Path,
         required=True,
-        help="Path to the source JSONL file.",
+        help="输入的 JSONL 源文件路径。",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("data/pretrain"),
-        help="Directory for the generated train/valid text files.",
+        help="生成的训练/验证集文本文件输出目录。",
     )
     parser.add_argument(
         "--text-key",
         type=str,
         default="text",
-        help="JSON key that contains the raw document text.",
+        help="JSON 对象中包含文档原始文本的字段名。",
     )
     parser.add_argument(
         "--valid-ratio",
         type=float,
         default=0.01,
-        help="Fraction of documents routed to validation via a deterministic text hash.",
+        help="通过确定性文本哈希分配到验证集的文档比例。",
     )
     parser.add_argument(
         "--document-separator",
         type=str,
         default="###",
-        help="Special token inserted between documents in train/valid outputs.",
+        help="在训练/验证集输出中插入文档之间的特殊分隔符。",
     )
     parser.add_argument(
         "--replace-literal",
         action="append",
         default=[],
-        help="Literal replacement rule in old=new form. Supports escape sequences like \\n on the right-hand side.",
+        help="字面量替换规则，格式为 旧=新。右侧支持 \\n 等转义序列。",
     )
-    # --- new cleaning arguments ---
+    # --- 清洗参数 ---
     parser.add_argument(
         "--min-length",
         type=int,
         default=50,
-        help="Minimum document length in characters after cleaning. Shorter docs are dropped. 0 to disable.",
+        help="清洗后文档的最小字符数，短于此值的文档被丢弃。设为 0 关闭此限制。",
     )
     parser.add_argument(
         "--max-length",
         type=int,
         default=0,
-        help="Maximum document length in characters. 0 means no limit.",
+        help="文档最大字符数限制。0 表示不限制。",
     )
     parser.add_argument(
         "--max-length-action",
         choices=["drop", "truncate"],
         default="drop",
-        help="What to do with documents exceeding --max-length: drop or truncate.",
+        help="超过 --max-length 的文档处理方式：drop（丢弃）或 truncate（截断）。",
     )
     parser.add_argument(
         "--clean-html",
         action="store_true",
         default=False,
-        help="Remove HTML-style tags (<...>) from text.",
+        help="去除文本中的 HTML 风格标签（<...>）。",
     )
     parser.add_argument(
         "--no-dedup",
         action="store_true",
         default=False,
-        help="Skip exact deduplication.",
+        help="跳过精确去重步骤。",
     )
     return parser
 
 
 def should_use_valid_split(text: str, valid_ratio: float) -> bool:
+    """判断一篇文档是否应归入验证集。
+
+    对文档文本做 SHA-1 哈希，映射到 [0, 2^64) 的桶中。归一化后的值
+    若小于 valid_ratio 则返回 True。每篇文档的分配结果完全由内容决定——
+    不依赖数据集顺序、随机种子或相邻文档，同一篇文档在任何运行中都会被
+    分到同一个集合中。
+    """
     digest = hashlib.sha1(text.encode("utf-8")).digest()
     bucket = int.from_bytes(digest[:8], byteorder="big", signed=False)
     return bucket / 2**64 < valid_ratio
 
 
 def parse_replacement_rules(raw_rules: list[str]) -> list[tuple[str, str]]:
+    """将 "旧=新" 格式的替换规则解析为 (旧文本, 新文本) 元组列表。
+
+    每条规则只按第一个 "=" 分割，因此右侧可以包含等号。
+    右侧部分通过 unicode_escape 编解码器处理，将字面转义序列（如 "\\n"）
+    转换为真正的控制字符。
+    """
     rules: list[tuple[str, str]] = []
     for raw_rule in raw_rules:
         if "=" not in raw_rule:
@@ -100,7 +130,7 @@ def parse_replacement_rules(raw_rules: list[str]) -> list[tuple[str, str]]:
     return rules
 
 
-# ---------- cleaning helpers ----------
+# ---------- 清洗辅助函数 ----------
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _MULTI_SPACE_RE = re.compile(r"[ \t]+")
@@ -109,26 +139,26 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def clean_control_chars(text: str) -> tuple[str, bool]:
-    """Remove control characters except \\n and \\t. Returns (cleaned, was_modified)."""
+    """去除控制字符（保留 \\n 和 \\t）。返回 (清洗后文本, 是否被修改过)。"""
     cleaned = _CONTROL_CHAR_RE.sub("", text)
     return cleaned, len(cleaned) != len(text)
 
 
 def compress_whitespace(text: str) -> tuple[str, bool]:
-    """Compress runs of spaces/tabs to single space; compress 3+ newlines to 2."""
+    """压缩连续空格/Tab 为单个空格；将 3 个以上连续换行压缩为 2 个。"""
     cleaned = _MULTI_SPACE_RE.sub(" ", text)
     cleaned = _MULTI_NEWLINE_RE.sub("\n\n", cleaned)
     return cleaned, cleaned != text
 
 
 def clean_html_tags(text: str) -> tuple[str, bool]:
-    """Remove HTML-style tags. Returns (cleaned, was_modified)."""
+    """去除 HTML 风格标签（<...>）。返回 (清洗后文本, 是否被修改过)。"""
     cleaned = _HTML_TAG_RE.sub("", text)
     return cleaned, len(cleaned) != len(text)
 
 
 def compute_length_stats(lengths: list[int]) -> dict:
-    """Compute descriptive statistics for document lengths."""
+    """计算文档长度的描述性统计指标，包括均值和各分位数。"""
     if not lengths:
         return {"count": 0}
     sorted_lengths = sorted(lengths)
@@ -163,9 +193,15 @@ def compute_length_stats(lengths: list[int]) -> dict:
 
 
 def main() -> None:
+    """执行完整的 JSONL 转预训练数据流水线。
+
+    编排参数解析、文档读取、清洗管线（去除首尾空白、字面量替换、
+    控制字符清理、HTML 标签去除、空白压缩、长度过滤、去重）、
+    训练/验证集划分，并写入输出文件及记录配置与统计信息的 metadata JSON。
+    """
     args = build_parser().parse_args()
     if not 0.0 <= args.valid_ratio < 1.0:
-        raise ValueError("--valid-ratio must be between 0 (inclusive) and 1 (exclusive)")
+        raise ValueError("--valid-ratio 必须在 [0.0, 1.0) 区间内")
     replacement_rules = parse_replacement_rules(args.replace_literal)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -174,7 +210,7 @@ def main() -> None:
     tokenizer_corpus_path = args.output_dir / "tokenizer_corpus.txt"
     metadata_path = args.output_dir / "metadata.json"
 
-    # counters
+    # 计数器
     total_raw = 0
     skipped_empty = 0
     skipped_short = 0
@@ -214,39 +250,39 @@ def main() -> None:
 
             total_raw += 1
 
-            # 1. strip
+            # 1. 去除首尾空白
             text = text.strip()
             if not text:
                 skipped_empty += 1
                 continue
 
-            # 2. literal replacement
+            # 2. 字面量替换
             for old, new in replacement_rules:
                 text = text.replace(old, new)
 
-            # 3. control character cleaning
+            # 3. 控制字符清洗
             text, ctrl_modified = clean_control_chars(text)
             if ctrl_modified:
                 cleaned_control += 1
 
-            # 4. HTML tag cleaning
+            # 4. HTML 标签清洗
             if args.clean_html:
                 text, html_modified = clean_html_tags(text)
                 if html_modified:
                     cleaned_html_count += 1
 
-            # 5. whitespace compression
+            # 5. 空白压缩
             text, ws_modified = compress_whitespace(text)
             if ws_modified:
                 compressed_ws += 1
 
-            # 6. final strip
+            # 6. 再次去除首尾空白
             text = text.strip()
             if not text:
                 skipped_empty += 1
                 continue
 
-            # 7. length filtering
+            # 7. 长度过滤
             text_len = len(text)
             if args.min_length > 0 and text_len < args.min_length:
                 skipped_short += 1
@@ -255,11 +291,11 @@ def main() -> None:
                 if args.max_length_action == "drop":
                     skipped_long += 1
                     continue
-                else:  # truncate
+                else:  # 截断
                     text = text[:args.max_length]
                     text_len = args.max_length
 
-            # 8. deduplication
+            # 8. 去重
             if not args.no_dedup:
                 doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 if doc_hash in seen_hashes:
