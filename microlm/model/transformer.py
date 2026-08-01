@@ -41,6 +41,7 @@ class Linear(nn.Module):
     权重初始化采用截断正态分布（truncated normal），标准差 = sqrt(2/(in+out))，
     截断边界在 ±3*std。比 nn.Linear 更透明——权重就是一个裸 Parameter，
     后续 LoRA 注入时可以直接替换为 LoRALinear 而无需绕过任何内部封装。
+    一个形状、行为与 nn.Linear 一致的线性层，但用截断正态初始化让训练更稳定，用裸 Parameter 让权重裸露在外——方便后续 LoRA 等微调技术直接替换权重，无需绕过 nn.Linear 的内部封装。
     """
 
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -63,6 +64,7 @@ class Embedding(nn.Module):
     不同于标准 nn.Embedding 使用 N(0,1) 初始化，这里使用截断正态分布 std=1.0。
     本质就是权重矩阵的索引查表：forward 时直接从权重中取出对应 token 的行向量。
     不包含任何额外的缩放或 norm 操作。
+    Embedding 就是一个 (词表大小 × 向量维度) 的权重矩阵，forward 做索引查表——输入 token ID，输出对应的行向量。用截断正态 σ=1.0 初始化，砍掉 ±3σ 外的离群值，比标准 nn.Embedding 更稳定、更透明。
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, device=None, dtype=None):
@@ -131,6 +133,7 @@ class SwiGLU(nn.Module):
 
     d_ff = 1344 ≈ 2.625 × d_model，使 SwiGLU（3 个权重矩阵）的总参数量
     与标准 FFN（d_ff=4*d_model，2 个权重矩阵）大致持平。
+    SwiGLU = 两路并行：W1 经 SiLU 产出门控信号（可正可负，平滑无断点），W3 保留原始信息，两者逐元素相乘后经 W2 投影回原维度。门控不仅能"放行/阻挡"，还能翻转信息符号，比 ReLU 的 0/1 硬开关更灵活。
     """
 
     def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
@@ -176,6 +179,7 @@ class KVCache:
       2. prefill 阶段：forward(token_ids, use_cache=True) → 每层缓存填满
       3. decode 阶段：forward(next_token, use_cache=True) → 追加到缓存末尾
       4. 调用 kv_cache.reset() 清空，开始新一轮生成
+      KVCache 是两层列表（一层一个 [None]*N），存每层 Transformer 的历史 K/V 张量。自回归生成时，prefill 填缓存，decode 拼接追加大新 token 的 K/V。没有缓存每轮重算全部历史（O(N²)），有缓存每轮只算一个 token（O(N)）。
     """
 
     def __init__(self, num_layers: int):
@@ -323,6 +327,8 @@ class MultiHeadSelfAttention(nn.Module):
     支持两种模式：
       - 训练 / prefill（use_cache=False）：使用 causal mask 防止看到未来 token
       - decode（use_cache=True）：无 mask（只有 1 个 query），拼接历史 KV 缓存
+
+      512 维投影后切成 (8 heads × 64 dim)，每头独立做 Q/K/V attention（Q/K 加 RoPE 旋转），8 头的 64 维输出拼回 512 维，经 output_proj 跨头混合。Decode 时拼接历史 KV 缓存省计算，Prefill 时用 causal mask 防偷看未来。
     """
 
     def __init__(self, d_model: int, num_heads: int, max_seq_len: int | None = None, theta: float | None = None,
@@ -393,89 +399,6 @@ class MultiHeadSelfAttention(nn.Module):
 
         # ---- 拼接多头 + 输出投影 ----
         # ... head seq d_head → ... seq (head * d_head) = ... seq d_model
-        attn_out = rearrange(attn_out, "... head seq d -> ... seq (head d)")
-        out = self.output_proj(attn_out)
-
-        if use_cache:
-            return out, new_k, new_v
-        return out
-
-
-def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    shifted = x - x.max(dim=dim, keepdim=True).values
-    exp_shifted = torch.exp(shifted)
-    return exp_shifted / exp_shifted.sum(dim=dim, keepdim=True)
-
-
-def scaled_dot_product_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    d_k = q.shape[-1]
-    # Use float32 for the score/softmax path so fp16 inference stays numerically stable.
-    attn_dtype = v.dtype
-    scores = torch.einsum(
-        "... q d, ... k d -> ... q k",
-        q.to(torch.float32),
-        k.to(torch.float32),
-    ) / math.sqrt(d_k)
-    if mask is not None:
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-    probs = softmax(scores, dim=-1).to(attn_dtype)
-    return torch.einsum("... q k, ... k d -> ... q d", probs, v.to(attn_dtype))
-
-
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, max_seq_len: int | None = None, theta: float | None = None,
-                 device=None, dtype=None):
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-        self.num_heads = num_heads
-        self.d_head = d_model // num_heads
-        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.rope = None
-        if theta is not None and max_seq_len is not None:
-            self.rope = RotaryPositionalEmbedding(theta=theta, d_k=self.d_head, max_seq_len=max_seq_len, device=device)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_positions: torch.Tensor | None = None,
-        past_k: torch.Tensor | None = None,
-        past_v: torch.Tensor | None = None,
-        use_cache: bool = False,
-    ):
-        seq_len = x.shape[-2]
-        leading_shape = x.shape[:-2]
-
-        q = rearrange(self.q_proj(x), "... seq (head d) -> ... head seq d", head=self.num_heads)
-        k = rearrange(self.k_proj(x), "... seq (head d) -> ... head seq d", head=self.num_heads)
-        v = rearrange(self.v_proj(x), "... seq (head d) -> ... head seq d", head=self.num_heads)
-
-        if self.rope is not None:
-            if token_positions is None:
-                token_positions = torch.arange(seq_len, device=x.device)
-                token_positions = token_positions.view(*([1] * len(leading_shape)), seq_len).expand(*leading_shape, seq_len)
-            q = self.rope(q, token_positions)
-            k = self.rope(k, token_positions)
-
-        if use_cache:
-            if past_k is not None:
-                k = torch.cat([past_k, k], dim=-2)
-                v = torch.cat([past_v, v], dim=-2)
-            attn_out = scaled_dot_product_attention(q, k, v, mask=None)
-            new_k, new_v = k, v
-        else:
-            causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool))
-            attn_out = scaled_dot_product_attention(q, k, v, mask=causal_mask)
-            new_k, new_v = None, None
-
         attn_out = rearrange(attn_out, "... head seq d -> ... seq (head d)")
         out = self.output_proj(attn_out)
 
