@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('microlm/model/transformer.py'\\).read\\(\\)\\); print\\('OK - valid Python syntax'\\)\")"
+    ]
+  }
+}
