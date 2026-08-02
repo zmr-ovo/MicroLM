@@ -57,7 +57,7 @@ from microlm.training import load_model_state, load_checkpoint, masked_cross_ent
 def load_config_defaults(config_path: str | None) -> dict[str, object]:
     """从 JSON 配置文件加载所有超参数默认值。
 
-    配置文件结构（六个 section）：
+    配置文件结构（七个 section）：
       - tokenizer: vocab_path, merges_path, special_tokens
       - model:     context_length, d_model, num_layers, num_heads, d_ff, vocab_size,
                     rope_theta, use_rms_norm, norm_mode, ffn_type
