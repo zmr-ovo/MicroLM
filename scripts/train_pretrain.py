@@ -1,3 +1,28 @@
+"""语言模型预训练脚本 —— 完整的训练流水线。
+
+本脚本整合项目的所有组件，构成一条端到端的预训练流水线：
+
+  1. 参数解析：命令行参数 > JSON 配置文件 > 代码默认值（三级优先级）
+  2. 数据加载：读取 token 化语料的 .npy 或 .memmap 文件
+  3. 模型构建：根据参数实例化 TransformerLM（31.7M 参数）
+  4. 训练循环：随机采样 → 前向 → 交叉熵损失 → 反向传播 → 权重更新
+  5. 验证 & 日志：每 100 步在验证集评估，WandB 实时记录
+  6. 检查点保存：每 1000 步保存模型+优化器状态，支持中断续训
+
+训练循环的核心结构（每一步 iteration）：
+    lr = cosine_schedule(iter)              # 更新学习率
+    x, y = get_batch(train_data)            # 随机采样一个批次
+    logits = model(x)                       # 前向传播
+    loss = cross_entropy(logits, y)         # 下一个 token 预测损失
+    loss.backward()                         # 反向传播
+    clip_gradient_norm(max_norm=1.0)        # 梯度裁剪（防爆炸）
+    optimizer.step()                        # AdamW 权重更新
+
+使用方式：
+    python train_pretrain.py --config configs/base.json
+    python train_pretrain.py --train_data_path data/train.npy --valid_data_path data/valid.npy
+"""
+
 import argparse
 import json
 import os
@@ -14,7 +39,28 @@ from microlm.training import get_batch
 from microlm.training import save_checkpoint, load_checkpoint
 from microlm.training import cross_entropy
 
+
 def load_config_defaults(config_path: str | None) -> dict[str, object]:
+    """从 JSON 配置文件加载所有超参数默认值。
+
+    配置文件结构（五个 section）：
+      - model:    vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, ...
+      - optimizer: lr, warmup_iters, min_lr, max_norm, weight_decay
+      - training:  batch_size, max_iters, out_dir, device, seed
+      - data:      train_data_path, valid_data_path
+      - logging:   run_name, wandb_project, mode
+
+    特殊处理：
+      - use_rms_norm=False → 转为布尔开关 --no_rms_norm
+      - rope_theta=None    → 转为布尔开关 --no_rope
+      - 值为 None 的键不会进入 defaults（由 argparse 的 default 兜底）
+
+    Args:
+        config_path: JSON 配置文件路径，传 None 时返回空 dict（全用命令行默认值）
+
+    Returns:
+        过滤掉 None 值后的参数字典，作为 argparse 的 defaults 基准
+    """
     if config_path is None:
         return {}
 
@@ -54,15 +100,35 @@ def load_config_defaults(config_path: str | None) -> dict[str, object]:
         "rope_theta": model.get("rope_theta"),
     }
 
+    # 布尔型参数的映射：JSON 中的 False/None → argparse 的 --no_xxx 开关
     if model.get("use_rms_norm") is False:
         defaults["no_rms_norm"] = True
     if model.get("rope_theta") is None:
         defaults["no_rope"] = True
 
+    # 剔除 None 值，让 argparse 的 default= 参数接管
     return {key: value for key, value in defaults.items() if value is not None}
 
 
 def build_parser(defaults: dict[str, object]) -> argparse.ArgumentParser:
+    """构建命令行参数解析器，defaults 来自 JSON 配置文件。
+
+    参数优先级：命令行 > JSON 配置文件 > 代码硬编码默认值。
+    每个 add_argument 的 default= 取 defaults 中的值（若存在），
+    否则使用代码硬编码的兜底值。
+
+    参数分四组：
+      - 模型结构：vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, ...
+      - 优化器：   lr, warmup_iters, min_lr, max_norm, weight_decay
+      - 数据 & 输出：train_data_path, valid_data_path, out_dir, device
+      - 日志：     run_name, wandb_project, wandb_mode
+
+    Args:
+        defaults: load_config_defaults() 返回的配置文件参数字典
+
+    Returns:
+        配置好的 ArgumentParser 实例
+    """
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--config", type=str, default=defaults.get("config"))
@@ -128,6 +194,16 @@ def build_parser(defaults: dict[str, object]) -> argparse.ArgumentParser:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数（三级优先级：命令行 > JSON 配置 > 代码默认值）。
+
+    分两趟解析：
+      1. 先解析 --config，确定 JSON 配置文件路径
+      2. 从 JSON 加载默认值，注入 ArgumentParser
+      3. 再解析其余命令行参数（覆盖 JSON 默认值）
+
+    Returns:
+        合并后的参数命名空间，可直接用 args.vocab_size 等方式访问
+    """
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=str, default=None)
     config_args, remaining = config_parser.parse_known_args()
@@ -139,6 +215,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def set_seed(seed: int) -> None:
+    """固定所有随机种子，保证实验可复现。
+
+    同时设置 numpy、PyTorch CPU 和所有 GPU 的随机种子。
+    cudnn 的确定性未强制（会损失性能），仅保证 Python 层采样一致。
+
+    Args:
+        seed: 随机种子整数
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -146,12 +230,42 @@ def set_seed(seed: int) -> None:
 
 
 def load_token_data(path: str) -> np.ndarray:
+    """加载 token 化语料文件，返回 numpy 数组（支持 .npy 和 .memmap）。
+
+    大语料（GB 级）使用 np.memmap 做内存映射——数据留在磁盘上，
+    只在切片访问时才读入对应页面，避免撑爆 RAM。小语料直接用 np.load。
+
+    .npy 文件从扩展名判别；无扩展名或其他后缀一律按 uint16 memmap 读取。
+
+    Args:
+        path: token 化数据的文件路径
+
+    Returns:
+        token ID 的一维 numpy 数组，形状 (total_tokens,)
+    """
     if path.endswith(".npy"):
         return np.load(path, mmap_mode="r")
     return np.memmap(path, dtype=np.uint16, mode="r")
 
 
 def main():
+    """预训练主入口。
+
+    完整流程：
+      1. 解析参数，创建输出目录，固定随机种子
+      2. 加载训练/验证数据（numpy memmap 避免大语料撑爆内存）
+      3. 构建 TransformerLM 模型，打印参数量并保存配置
+      4. 若存在检查点则恢复（支持中断续训）
+      5. 初始化 AdamW 优化器 + WandB 日志
+      6. 训练循环（见下方详细注释）
+      7. 保存最终检查点，关闭 WandB
+
+    训练循环每步做的事：
+      - 学习率按 cosine schedule 衰减（前 warmup_iters 步线性预热）
+      - 随机采样 → 前向 → 交叉熵损失 → 反向 → 梯度裁剪（不是截断单个数，是整体等比缩放） → 权重更新
+      - 每 100 步评估验证损失 + 日志输出
+      - 每 1000 步保存检查点（ckpt.pt）
+    """
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     set_seed(args.seed)
@@ -209,12 +323,14 @@ def main():
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # ---- 检查是否有中断的检查点，恢复训练 ----
     start_iter = 0
     ckpt_path = os.path.join(args.out_dir, "ckpt.pt")
     if os.path.exists(ckpt_path):
         start_iter = load_checkpoint(ckpt_path, model, optimizer)
         print(f"Resuming from iteration {start_iter}")
 
+    # ---- 初始化 WandB 在线实验追踪 ----
     wandb.init(
         project=args.wandb_project,
         name=args.run_name,
@@ -222,20 +338,26 @@ def main():
         config=resolved_config,
     )
 
+    # ═══════════════════════════════════════════════════════════
+    # 训练循环
+    # ═══════════════════════════════════════════════════════════
     for it in range(start_iter, args.max_iters):
+        # ① 余弦学习率调度：前 warmup_iters 步从 0 线性升至 lr，之后余弦衰减至 min_lr
         lr = get_lr_cosine_schedule(it, args.lr, args.min_lr, args.warmup_iters, args.max_iters)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
+        # ② 训练一步：采样 → 前向 → 损失 → 反向 → 梯度裁剪 → 权重更新
         model.train()
         x, y = get_batch(train_data, args.batch_size, args.context_length, args.device)
-        logits = model(x)
-        loss = cross_entropy(logits, y)
-        optimizer.zero_grad()
-        loss.backward()
-        clip_gradient_norm(model.parameters(), args.max_norm)
-        optimizer.step()
+        logits = model(x)                                                # 前向传播
+        loss = cross_entropy(logits, y)                                  # 下一个 token 预测损失
+        optimizer.zero_grad()                                            # 清空上轮梯度
+        loss.backward()                                                  # 反向传播
+        clip_gradient_norm(model.parameters(), args.max_norm)            # 梯度裁剪（防爆炸）
+        optimizer.step()                                                 # AdamW 权重更新
 
+        # ③ 每 100 步在验证集评估 + 日志
         if it % 100 == 0 or it == args.max_iters - 1:
             model.eval()
             with torch.no_grad():
@@ -252,9 +374,11 @@ def main():
                     }
                 )
 
+        # ④ 每 1000 步保存检查点（覆盖写入，始终保留最新）
         if it % 1000 == 0 and it > 0:
             save_checkpoint(model, optimizer, it, ckpt_path)
 
+    # 训练结束：保存最终检查点
     save_checkpoint(model, optimizer, args.max_iters, os.path.join(args.out_dir, "ckpt_final.pt"))
     wandb.finish()
 
