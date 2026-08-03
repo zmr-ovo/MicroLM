@@ -1,9 +1,24 @@
-"""MicroLM interactive multi-turn chat REPL.
+"""MicroLM 交互式多轮对话聊天（REPL）。
 
-Supports SFT and LoRA checkpoints, runtime parameter switching,
-conversation history with context-length aware truncation, and session logging.
+本脚本构建完整的聊天体验，支持：
+  - SFT / LoRA 检查点自动加载与模型重建
+  - 多轮对话历史管理（自动拼接上下文 + context-length 感知截断）
+  - 运行时参数调整（/temp、/topp、/system、/clear 等 REPL 命令）
+  - 会话日志持久化（JSONL 格式记录每轮对话）
+  - Unicode surrogate 字符过滤（小模型可能生成无效码点导致 re-encode 崩溃）
 
-Usage:
+与 generate_text.py 的关键区别：
+  - generate_text.py：单次生成，无状态，适合脚本调用和批处理
+  - chat.py：交互式 REPL，维护完整对话历史，每轮自动拼接上下文重新生成
+
+核心类 ChatSession 封装了完整的对话生命周期：
+  1. 用户输入 → 追加到 conversations 历史
+  2. 历史 + system prompt → render → tokenize
+  3. 超长时自动截断最早轮次（保留用户轮配对删除）
+  4. 送入模型生成 → decode → 清洗 → 追加到历史
+  5. 记录到日志文件（可选）
+
+使用方式：
     # SFT checkpoint
     python scripts/chat.py \
         --checkpoint-path outputs/sft_baseline/ckpt_final.pt \
@@ -40,12 +55,11 @@ from microlm.training.sft import ROLE_MARKERS
 
 
 def _remove_surrogates(text: str) -> str:
-    """Remove Unicode surrogate characters that crash .encode('utf-8').
+    """移除 Unicode surrogate 字符（U+D800–U+DFFF），防止 re-encode 崩溃。
 
-    Small LMs can produce token sequences that decode to surrogate code points
-    (U+D800–U+DFFF).  Storing these in conversation history and re-encoding on
-    the next turn raises ``UnicodeEncodeError``.  Stripping them is safe because
-    they carry no semantic meaning.
+    小模型可能生成 token 序列解码出无意义的 surrogate 码点。
+    这些字符在下轮拼接上下文、重新 encode 时会抛出 UnicodeEncodeError。
+    它们不携带语义信息，安全移除即可。
     """
     # Python's regex module supports \p{Cs} (surrogate code points)
     import regex as re
@@ -53,22 +67,38 @@ def _remove_surrogates(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model / tokenizer loading helpers (adapted from generate_text.py)
+# 模型 / Tokenizer 加载辅助函数（与 generate_text.py 共用部分逻辑）
 # ---------------------------------------------------------------------------
 
 def resolve_device(device_arg: str) -> str:
+    """解析设备参数，"auto" 时自动检测 GPU/CPU 可用性。
+
+    Args:
+        device_arg: "auto" / "cuda" / "cpu"
+
+    Returns:
+        实际使用的设备字符串
+    """
     if device_arg != "auto":
         return device_arg
     if not torch.cuda.is_available():
         return "cpu"
     try:
-        torch.empty(1, device="cuda")
+        torch.empty(1, device="cuda")     # 试探性分配显存
         return "cuda"
     except Exception:
         return "cpu"
 
 
 def get_torch_dtype(dtype_name: str) -> torch.dtype:
+    """dtype 名称字符串 → PyTorch dtype 对象。
+
+    Args:
+        dtype_name: "float32" / "float16" / "bfloat16"
+
+    Returns:
+        对应的 torch.dtype
+    """
     dtype_map = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -78,6 +108,7 @@ def get_torch_dtype(dtype_name: str) -> torch.dtype:
 
 
 def resolve_model_dtype(dtype_name: str, device: str) -> torch.dtype:
+    """根据设备能力解析实际可用的 dtype（CPU 不支持 float16/bf16 时降级）。"""
     dtype = get_torch_dtype(dtype_name)
     if dtype == torch.float16 and device == "cpu":
         return torch.float32
@@ -87,6 +118,19 @@ def resolve_model_dtype(dtype_name: str, device: str) -> torch.dtype:
 
 
 def load_model_config(config_path: Path, vocab_size: int) -> dict:
+    """从 JSON 配置文件加载模型结构参数（model_config.json）。
+
+    与 generate_text.py 同名函数的关键区别：
+      - chat.py 中 config_path 是必需参数（通过 --config-path），不兜底命令行
+      - vocab_size 由 tokenizer 决定（可能含特殊 token 导致词表扩容）
+
+    Args:
+        config_path: model_config.json 文件路径
+        vocab_size:  tokenizer 的实际词表大小
+
+    Returns:
+        模型构造参数字典
+    """
     with config_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
     return {
@@ -101,6 +145,7 @@ def load_model_config(config_path: Path, vocab_size: int) -> dict:
 
 
 def normalize_state_dict_keys(state_dict: OrderedDict) -> OrderedDict:
+    """去掉 torch.compile 产生的 "_orig_mod." 前缀。"""
     normalized = OrderedDict()
     for key, value in state_dict.items():
         if key.startswith("_orig_mod."):
@@ -110,6 +155,7 @@ def normalize_state_dict_keys(state_dict: OrderedDict) -> OrderedDict:
 
 
 def load_state_dict(checkpoint_path: Path, device: str) -> OrderedDict:
+    """从检查点加载模型权重，兼容训练检查点和裸 state_dict。"""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
@@ -121,11 +167,20 @@ def load_state_dict(checkpoint_path: Path, device: str) -> OrderedDict:
 
 
 # ---------------------------------------------------------------------------
-# Chat session
+# 聊天会话（ChatSession）
 # ---------------------------------------------------------------------------
 
 class ChatSession:
-    """Manages multi-turn conversation state and model interaction."""
+    """管理多轮对话状态和模型交互的核心类。
+
+    职责：
+      - 维护对话历史列表 self.conversations
+      - 每次 chat() 调用时：拼接历史 → render → tokenize → 生成 → decode → 追加到历史
+      - 超长时自动截断最早轮次（保留 system prompt，按用户轮配对删除）
+      - 运行时参数可调（temperature、top_p 通过 REPL 命令实时修改）
+      - Unicode surrogate 过滤（小模型可能解码出无效码点）
+      - 可选日志持久化（JSONL 格式）
+    """
 
     def __init__(
         self,
@@ -139,6 +194,19 @@ class ChatSession:
         system_prompt: str | None = None,
         log_path: str | None = None,
     ) -> None:
+        """初始化聊天会话。
+
+        Args:
+            model:           已加载权重的 TransformerLM 模型
+            tokenizer:        BPE 分词器实例
+            eos_token:        EOS token 字符串（生成到此时停止）
+            context_length:   模型最大上下文长度
+            max_new_tokens:   每轮最多生成多少个新 token
+            temperature:      采样温度（0=贪婪解码，>0=随机采样）
+            top_p:            nucleus sampling 阈值
+            system_prompt:    可选系统提示词（每轮自动拼接）
+            log_path:         可选日志文件路径（JSONL 格式）
+        """
         self.model = model
         self.tokenizer = tokenizer
         self.eos_token = eos_token
@@ -151,7 +219,7 @@ class ChatSession:
         self.log_path = log_path
         self._log_file = None
 
-        # Resolve eos_token_id — only use it if the token is within model's vocab range
+        # 解析 EOS token ID（只在模型词表范围内有效）
         eos_bytes = eos_token.encode("utf-8")
         model_vocab_size = model.token_embeddings.weight.shape[0]
         if eos_bytes in tokenizer.vocab_to_id:
@@ -166,10 +234,13 @@ class ChatSession:
         if system_prompt:
             self._log_entry({"role": "system", "content": system_prompt})
 
-    # ---- conversation management ------------------------------------------
+    # ---- 对话历史管理 ---------------------------------------------------
 
     def _build_prompt_conversations(self) -> list[dict[str, str]]:
-        """Build the conversation list with optional system prompt prepended."""
+        """构建当前轮次的对话列表（system prompt + 历史对话）。
+
+        每次 chat() 调用时都重新构建——因为可能有运行时 system prompt 变更。
+        """
         convs = []
         if self.system_prompt:
             convs.append({"role": "system", "content": self.system_prompt})
@@ -177,26 +248,25 @@ class ChatSession:
         return convs
 
     def _truncate_conversations(self, prompt_ids: list[int]) -> list[dict[str, str]]:
-        """Truncate earliest turns if prompt exceeds context budget.
+        """超长时截断最早轮次，保留 system prompt + 最近轮次。
 
-        Keeps system prompt + most recent turns. Removes complete
-        (user, assistant) pairs from the front.
+        预算 = context_length - max_new_tokens - 16（16 是安全余量，给特殊 token）。
+        策略：从对话开头删轮次（不管 user 还是 assistant），每次删一轮后
+        重新 encode 检查长度。无法 encode 时（Unicode 异常等）直接退出循环。
+
+        注意：system prompt 始终保留不删。
         """
-        budget = self.context_length - self.max_new_tokens - 16  # 16 token margin
+        budget = self.context_length - self.max_new_tokens - 16
         if len(prompt_ids) <= budget:
             return self._build_prompt_conversations()
 
         convs = self._build_prompt_conversations()
-        # System prompt is always at index 0 if present
         has_system = convs and convs[0]["role"] == "system"
         system_part = [convs[0]] if has_system else []
         dialogue = convs[1:] if has_system else convs
 
-        # Remove pairs from the front until it fits
         while dialogue and len(prompt_ids) > budget:
-            # Remove the first turn (could be user or assistant)
-            dialogue.pop(0)
-            # Re-encode to check length
+            dialogue.pop(0)                              # 删除最早的一轮
             trial = system_part + dialogue
             if dialogue:
                 try:
@@ -210,12 +280,14 @@ class ChatSession:
         return system_part + dialogue
 
     def _render_prompt(self, convs: list[dict[str, str]]) -> str:
-        """Render conversation list into a prompt string for generation.
+        """将对话列表渲染为模型可接受的纯文本 prompt。
 
-        Must match the SFT training format (render_chat_prompt in sft.py):
-        - Each assistant message is followed by eos_token + "\\n" (only if
-          eos_token_id is within the model's vocab range)
-        - Final assistant marker is appended to trigger generation
+        格式必须与训练时的 render_chat_prompt (sft.py) 严格一致：
+          <|role|>\ncontent\n<|endoftext|>\n  （assistant 轮追加 eos）
+        末尾追加 "<|assistant|>\n" 引导模型开始生成回复。
+
+        与训练时的重要区别：EOS 只在 eos_token_id 有效时才拼接——
+        因为 chat.py 使用的 EOS token 可能不在模型词表范围内（如 "</s>"）。
         """
         parts: list[str] = []
         for message in convs:
@@ -225,29 +297,45 @@ class ChatSession:
             parts.append(content)
             parts.append("\n")
             if role == "assistant" and self.eos_token_id is not None:
-                # Only append EOS if its token ID is valid for this model
                 parts.append(self.eos_token)
                 parts.append("\n")
-        # Append assistant marker to trigger generation
         parts.append(ROLE_MARKERS["assistant"])
         return "".join(parts)
 
     def chat(self, user_input: str) -> str:
-        """Process one user turn and return the assistant's reply."""
+        """处理一轮用户输入，返回模型生成的回复。
+
+        完整流程（每轮都执行，无缓存）：
+          1. 用户输入追加到 conversations 历史
+          2. 历史 + system prompt → render → tokenize
+          3. token ID 安全裁剪（超出模型词表大小的 ID 被丢弃）
+          4. 超长截断：token 数超过预算时，从最早轮次删对话
+          5. 硬裁剪兜底：截断后还超长则只保留最后 max_prompt_len 个 token
+          6. 送入模型生成（greedy 或 temperature+top-p）
+          7. decode → 清洗 surrogate 字符 → 去除尾部 EOS
+          8. 追加到历史 → 记录日志
+
+        Args:
+            user_input: 用户输入的原始文本
+
+        Returns:
+            模型生成的回复文本
+        """
+        # ① 用户输入追加到历史
         self.conversations.append({"role": "user", "content": user_input})
         self._log_entry({"role": "user", "content": user_input})
 
-        # Build prompt
+        # ② 构建 prompt → render → tokenize
         convs = self._build_prompt_conversations()
         prompt_text = self._render_prompt(convs)
         prompt_ids = self.tokenizer.encode(prompt_text)
 
-        # Safety: clip token IDs that exceed model vocab size (e.g. EOS token
-        # may be at index 6400 while model embedding only has 6400 slots)
+        # ③ token ID 安全裁剪：丢弃超出模型 vocab_size 的 ID
+        #    （如 EOS 在 tokenizer 词表 index 6400，但模型 embedding 只有 6400 行）
         model_vocab_size = self.model.token_embeddings.weight.shape[0]
         prompt_ids = [tid for tid in prompt_ids if tid < model_vocab_size]
 
-        # Truncate if needed
+        # ④ 超长截断（避免上下文溢出）
         budget = self.context_length - self.max_new_tokens - 16
         if len(prompt_ids) > budget:
             convs = self._truncate_conversations(prompt_ids)
@@ -259,7 +347,7 @@ class ChatSession:
             self.conversations.append({"role": "assistant", "content": reply})
             return reply
 
-        # Ensure we don't exceed context
+        # ⑤ 硬裁剪兜底：截断后仍超长则只取最后 max_prompt_len 个 token
         max_prompt_len = self.context_length - self.max_new_tokens
         if len(prompt_ids) > max_prompt_len:
             prompt_ids = prompt_ids[-max_prompt_len:]
@@ -268,10 +356,10 @@ class ChatSession:
             [prompt_ids], dtype=torch.long, device=next(self.model.parameters()).device
         )
 
-        # Generate
+        # ⑥ 生成
         with torch.no_grad():
             if self.temperature == 0.0:
-                # Greedy
+                # Greedy：确定性解码，无 KV Cache
                 generated = prompt_tensor.clone()
                 for _ in range(self.max_new_tokens):
                     idx_cond = generated[:, -self.model.context_length:]
@@ -284,6 +372,7 @@ class ChatSession:
                         break
                 full_ids = generated[0].tolist()
             else:
+                # temperature + top-p 采样：KV Cache 加速
                 output = self.model.generate(
                     prompt_ids=prompt_tensor,
                     max_new_tokens=self.max_new_tokens,
@@ -293,24 +382,29 @@ class ChatSession:
                 )
                 full_ids = output[0].tolist()
 
+        # ⑦ decode → 清洗
         new_ids = full_ids[len(prompt_ids):]
         reply = self.tokenizer.decode(new_ids).strip()
+        reply = _remove_surrogates(reply)              # 移除无效 Unicode 码点
 
-        # Sanitize: remove surrogate characters that would crash re-encoding
-        reply = _remove_surrogates(reply)
-
-        # Clean up EOS token from reply
+        # ⑧ 去掉尾部 EOS token
         if self.eos_token and reply.endswith(self.eos_token):
             reply = reply[: -len(self.eos_token)].strip()
 
+        # ⑨ 追加到历史 + 日志
         self.conversations.append({"role": "assistant", "content": reply})
         self._log_entry({"role": "assistant", "content": reply})
 
         return reply
 
-    # ---- logging ----------------------------------------------------------
+    # ---- 日志持久化 ------------------------------------------------------
 
     def _log_entry(self, entry: dict[str, str]) -> None:
+        """写入一条带时间戳的对话日志（JSONL 格式，立即 flush 防丢失）。
+
+        Args:
+            entry: 包含 "role" 和 "content" 的字典
+        """
         if self._log_file is None:
             return
         entry_with_ts = {
@@ -319,16 +413,19 @@ class ChatSession:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._log_file.write(json.dumps(entry_with_ts, ensure_ascii=False) + "\n")
-        self._log_file.flush()
+        self._log_file.flush()                          # 立即写盘，防止崩溃丢失
 
     def save_log(self, path: str | None = None) -> None:
-        """Save full conversation to a JSONL file."""
+        """将会话完整记录保存为 JSONL 文件。
+
+        Args:
+            path: 目标文件路径，None 时使用初始化时的 log_path 或提示需要 /save
+        """
         target = path or self.log_path
         if not target:
             print("[No log path specified. Use /save <path>]")
             return
         with open(target, "w", encoding="utf-8") as f:
-            # Write system prompt if present
             if self.system_prompt:
                 entry = {
                     "role": "system",
@@ -346,27 +443,33 @@ class ChatSession:
         print(f"[Session saved to {target}]")
 
     def close(self) -> None:
+        """关闭日志文件句柄（会话结束时调用）。"""
         if self._log_file:
             self._log_file.close()
 
-    # ---- REPL commands ----------------------------------------------------
+    # ---- REPL 命令处理 ----------------------------------------------------
 
     def clear_history(self) -> None:
+        """清空对话历史（system prompt 不受影响）。"""
         self.conversations.clear()
         print("[Conversation history cleared]")
 
     def show_history(self) -> None:
+        """打印当前对话历史（超长内容截断为 100 字符）。"""
         if self.system_prompt:
             print(f"  system: {self.system_prompt}")
         for i, conv in enumerate(self.conversations):
             role = conv["role"]
             content = conv["content"]
-            # Truncate long content for display
             if len(content) > 100:
                 content = content[:100] + "..."
             print(f"  [{role}]: {content}")
 
     def set_temperature(self, value: str) -> None:
+        """运行时调整 temperature（REPL 命令 /temp）。
+
+        设为 0 切换到 greedy 解码（确定性输出），设为正数增加随机性。
+        """
         try:
             self.temperature = float(value)
             print(f"[temperature set to {self.temperature}]")
@@ -374,6 +477,10 @@ class ChatSession:
             print(f"[Invalid value: {value}]")
 
     def set_top_p(self, value: str) -> None:
+        """运行时调整 top-p 阈值（REPL 命令 /topp）。
+
+        必须在 [0.0, 1.0] 范围内。
+        """
         try:
             v = float(value)
             if not (0.0 <= v <= 1.0):
@@ -384,6 +491,10 @@ class ChatSession:
             print(f"[Invalid value: {value}. Must be in [0.0, 1.0]]")
 
     def set_system_prompt(self, text: str) -> None:
+        """运行时设置或清除 system prompt（REPL 命令 /system）。
+
+        传入空字符串清除 system prompt，之后轮次不再自动拼接。
+        """
         self.system_prompt = text if text else None
         if self.system_prompt:
             print(f"[system prompt set: {self.system_prompt}]")
@@ -393,6 +504,10 @@ class ChatSession:
 
 # ---------------------------------------------------------------------------
 # Model loading
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 模型加载
 # ---------------------------------------------------------------------------
 
 def load_chat_model(
@@ -405,7 +520,32 @@ def load_chat_model(
     dtype: str = "float32",
     device: str = "auto",
 ) -> tuple[TransformerLM, BPETokenizer, dict]:
-    """Load model, tokenizer, and config. Returns (model, tokenizer, config)."""
+    """一次性加载模型、分词器和配置。
+
+    完整加载链路：
+      1. 设备检测 (GPU/CPU) + dtype 解析
+      2. BPETokenizer 从 vocab/merges 文件加载
+      3. 从 model_config.json 读取模型结构参数
+      4. 实例化 TransformerLM → 加载预训练权重
+      5. 可选 LoRA：apply_lora → load_lora_state → merge（熔合到基座）
+      6. model.eval()（关 Dropout 等）
+
+    LoRA 加载后直接 merge 到基座权重，推理时无额外开销。
+    后续如需继续训练，需先 unmerge 恢复原始权重。
+
+    Args:
+        checkpoint_path: 预训练检查点 .pt 文件路径
+        config_path:     model_config.json 路径
+        vocab_path:      BPE 词表文件路径
+        merges_path:     BPE 合并规则文件路径
+        eos_token:       EOS token 字符串
+        lora_path:       可选 LoRA 适配器 .pt 文件路径
+        dtype:           "float32" / "float16" / "bfloat16"
+        device:          "auto" / "cuda" / "cpu"
+
+    Returns:
+        (model, tokenizer, config) 三元组
+    """
     device = resolve_device(device)
     torch_dtype = resolve_model_dtype(dtype, device)
 
@@ -433,12 +573,12 @@ def load_chat_model(
     state_dict = load_state_dict(checkpoint_path, device)
     model.load_state_dict(state_dict)
 
-    # Apply LoRA if specified
+    # LoRA：加载适配器 → 熔合到基座（推理无额外开销）
     if lora_path is not None:
         apply_lora_to_model(model)
         lora_state = torch.load(lora_path, map_location=device, weights_only=False)
         load_lora_state_dict(model, lora_state)
-        merge_lora(model)
+        merge_lora(model)                      # 熔合后 = 普通模型
 
     model.eval()
     return model, tokenizer, config
@@ -448,7 +588,26 @@ def load_chat_model(
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 命令行参数 + REPL 交互循环
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数。
+
+    必需参数（5 个）：
+      --checkpoint-path  预训练检查点路径
+      --config-path      model_config.json 路径
+      --vocab-path       BPE 词表文件
+      --merges-path      BPE 合并规则文件
+      --eos-token        EOS token（如 "</s>"）
+
+    可选参数：
+      --lora-path        LoRA 适配器路径
+      --system-prompt    初始 system prompt
+      --log              会话日志路径（JSONL 格式）
+      --temperature / --top-p / --max-new-tokens / --dtype / --device / --seed
+    """
     parser = argparse.ArgumentParser(
         description="MicroLM interactive multi-turn chat.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -497,7 +656,18 @@ Type your message to chat with the model. Press Ctrl+C or /quit to exit.
 
 
 def repl(session: ChatSession) -> None:
-    """Run the interactive read-eval-print loop."""
+    """交互式 REPL（Read-Eval-Print Loop）主循环。
+
+    循环流程：
+      1. 显示启动信息（temperature、top_p、system prompt）
+      2. 等待用户输入 → 识别 REPL 命令（以 / 开头）或普通聊天消息
+      3. REPL 命令：/temp、/topp、/system、/clear、/history、/save、/help、/quit
+      4. 普通消息：session.chat(user_input) → 打印回复 + 耗时
+      5. Ctrl+C 或 Ctrl+D 或 /quit 退出
+
+    Args:
+        session: 已初始化好的 ChatSession 实例
+    """
     print("=" * 60)
     print("  MicroLM Chat  (type /help for commands, /quit to exit)")
     print("=" * 60)
@@ -517,7 +687,7 @@ def repl(session: ChatSession) -> None:
             if not user_input:
                 continue
 
-            # Handle REPL commands
+            # ---- REPL 命令处理 ----
             if user_input.startswith("/"):
                 parts = user_input.split(maxsplit=1)
                 cmd = parts[0].lower()
@@ -549,7 +719,7 @@ def repl(session: ChatSession) -> None:
                     print(f"[Unknown command: {cmd}. Type /help for available commands]")
                 continue
 
-            # Normal chat
+            # ---- 普通聊天 ----
             start = time.time()
             reply = session.chat(user_input)
             elapsed = time.time() - start
@@ -565,6 +735,7 @@ def repl(session: ChatSession) -> None:
 
 
 def main() -> None:
+    """聊天入口：解析参数 → 加载模型 → 创建会话 → 启动 REPL。"""
     args = parse_args()
     torch.manual_seed(args.seed)
 
