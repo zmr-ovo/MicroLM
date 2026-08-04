@@ -735,10 +735,33 @@ def repl(session: ChatSession) -> None:
 
 
 def main() -> None:
-    """聊天入口：解析参数 → 加载模型 → 创建会话 → 启动 REPL。"""
+    """聊天入口：加载模型 → 创建会话 → 启动 REPL 交互循环。
+
+    完整流程（4 步）：
+      1. 解析命令行参数 + 固定随机种子（seed=42 保证可复现）
+      2. 调用 load_chat_model() 一次性完成：
+           - 设备检测（GPU/CPU 自动选择）
+           - BPE 分词器加载（vocab + merges + 特殊 token）
+           - 从 model_config.json 重建模型结构
+           - 加载预训练 checkpoint 权重
+           - 可选加载 LoRA 适配器并 merge 到基座（推理无额外开销）
+      3. 创建 ChatSession 实例，配置：
+           - 生成参数（temperature、top_p、max_new_tokens）
+           - system prompt（可选，每轮自动拼到对话开头）
+           - 日志路径（可选，JSONL 格式持久化）
+      4. 启动 repl(session) 进入交互循环
+
+    启动后用户看到的信息：
+      - 设备名 + context_length
+      - LoRA 适配器路径（如使用）
+      - 当前 temperature、top_p、max_new_tokens
+      - system prompt 内容（如有）
+      - > 提示符等待输入
+    """
     args = parse_args()
     torch.manual_seed(args.seed)
 
+    # ---- 步骤 2：加载模型（设备 + tokenizer + 模型结构 + 权重 + LoRA） ----
     print("Loading model...")
     model, tokenizer, config = load_chat_model(
         checkpoint_path=args.checkpoint_path,
@@ -755,6 +778,7 @@ def main() -> None:
     if args.lora_path:
         print(f"LoRA adaptor loaded from {args.lora_path} (merged)")
 
+    # ---- 步骤 3：创建聊天会话 ----
     session = ChatSession(
         model=model,
         tokenizer=tokenizer,
@@ -767,6 +791,7 @@ def main() -> None:
         log_path=args.log,
     )
 
+    # ---- 步骤 4：进入 REPL 交互循环 ----
     repl(session)
 
 

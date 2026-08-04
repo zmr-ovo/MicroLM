@@ -1,13 +1,30 @@
-"""Benchmark KV Cache vs no-cache generation for MicroLM.
+"""KV Cache 性能基准测试脚本。
 
-Usage:
+本脚本对比同一模型在「无 KV Cache」和「有 KV Cache」两种解码模式下的
+生成速度，量化 KV Cache 带来的加速效果。
+
+测试矩阵（20 种配置组合）：
+  prompt 长度 × 生成长度 = [16, 32, 64, 128, 256] × [32, 64, 128, 256]
+
+每种配置执行流程：
+  1. 预热（warmup）：跑 2 次短生成（8 token），消除 GPU 冷启动抖动
+  2. 正式跑（bench）：跑 5 次完整生成，取平均值
+  3. 记录指标：无 cache 耗时、有 cache 总耗时/prefill 耗时/decode 耗时、加速比
+
+输出产物：
+  - kvcache_benchmark.csv  原始数据表（每个配置一行）
+  - kvcache_benchmark.json 结构化结果 + 测试配置元数据
+
+关键指标解读：
+  - speedup：无 cache 耗时 / 有 cache 总耗时，越大说明 KV Cache 越有价值
+  - decode_tps：decode 阶段每秒生成的 token 数（cache 模式的核心吞吐指标）
+  - prefill_time vs decode_time：prefill 一次 O(T²)，decode 每步 O(T)，
+    生成长度越大，decode 省的时间越多
+
+使用方式：
     python scripts/benchmark_kvcache.py \
         --checkpoint outputs/sft_baseline/ckpt_final.pt \
         --out-dir results/
-
-Outputs:
-    results/kvcache_benchmark.csv   — raw benchmark data
-    results/kvcache_benchmark.json  — structured results with metadata
 """
 from __future__ import annotations
 
@@ -26,6 +43,13 @@ from microlm.tokenizer import BPETokenizer
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数。
+
+    关键参数：
+      --warmup-runs 2  预热次数（消除 GPU 冷启动抖动）
+      --bench-runs  5  正式测试次数（取平均）
+      --dtype           默认 float32，GPU 可用 float16 加速
+    """
     p = argparse.ArgumentParser(description="Benchmark KV Cache for MicroLM")
     p.add_argument("--checkpoint", type=Path, default=Path("outputs/sft_baseline/ckpt_final.pt"))
     p.add_argument("--vocab-path", type=Path, default=Path("outputs/tokenizer_full_clean/vocab.json"))
@@ -42,6 +66,21 @@ def parse_args() -> argparse.Namespace:
 # ─── Model loading (reused from run_eval_prompts.py) ────────────────────────
 
 def load_model(checkpoint_path: Path, device: str, dtype: torch.dtype) -> TransformerLM:
+    """从检查点加载模型，自动处理 LoRA checkpoint 的 key 映射。
+
+    兼容三种检查点格式：
+      - 预训练裸 state_dict
+      - 训练检查点（含 model_state_dict 包装）
+      - LoRA 检查点（自动提取 original.weight → weight，跳过 lora_A/lora_B）
+
+    Args:
+        checkpoint_path: 检查点 .pt 文件路径
+        device:          "cuda" 或 "cpu"
+        dtype:           torch.float32 或 torch.float16
+
+    Returns:
+        已加载权重并设为 eval() 模式的 TransformerLM 模型
+    """
     config_path = checkpoint_path.parent / "model_config.json"
     with config_path.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -90,7 +129,20 @@ def generate_no_cache(
     prompt_ids: torch.Tensor,
     max_new_tokens: int,
 ) -> tuple[torch.Tensor, float]:
-    """Autoregressive decode without KV Cache — each step recomputes full sequence."""
+    """无 KV Cache 的自回归解码 —— 每步重新计算完整序列。
+
+    实现方式：每轮循环把整个 generated 序列（截断到 context_length）
+    送入模型，只取最后一个位置的 logit 采样。复杂度 O(T²·L)：
+    生成第 N 个 token 时要重新算前 N-1 个 token 的所有前向计算。
+
+    Args:
+        model:          已加载的 TransformerLM 模型
+        prompt_ids:     输入 prompt token IDs [1, prompt_len]
+        max_new_tokens: 生成多少个新 token
+
+    Returns:
+        (完整序列 token IDs, 总耗时秒数)
+    """
     generated = prompt_ids.clone()
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     t0 = time.perf_counter()
@@ -116,7 +168,24 @@ def generate_with_cache(
     prompt_ids: torch.Tensor,
     max_new_tokens: int,
 ) -> tuple[torch.Tensor, float, float, float]:
-    """Autoregressive decode with KV Cache — returns (output, total_time, prefill_time, decode_time)."""
+    """带 KV Cache 的自回归解码（prefill + decode 两阶段）。
+
+    Phase 1 — Prefill：prompt 全部 token 一次性送入，填充 K/V Cache。
+             复杂度 O(T²)，但只做一次。
+    Phase 2 — Decode：每步只输入 1 个新 token，K/V 来自 cache 拼接。
+             每步复杂度 O(T)，而非无 cache 时的 O(T²)。
+
+    第一步采样放在 prefill 内完成（不单独计 decode），所以 decode 循环
+    实际跑 max_new_tokens - 1 步。
+
+    Args:
+        model:          已加载的 TransformerLM 模型
+        prompt_ids:     输入 prompt token IDs [1, prompt_len]
+        max_new_tokens: 生成多少个新 token
+
+    Returns:
+        (完整序列, 总耗时, prefill耗时, decode耗时)
+    """
     generated = prompt_ids.clone()
 
     # Phase 1: Prefill
@@ -155,7 +224,7 @@ def generate_with_cache(
     return generated, total_time, prefill_time, decode_time
 
 
-# ─── Benchmark runner ───────────────────────────────────────────────────────
+# ─── 基准测试运行器 ─────────────────────────────────────────────────────
 
 def run_benchmark(
     model: TransformerLM,
@@ -166,6 +235,28 @@ def run_benchmark(
     bench_runs: int,
     device: str,
 ) -> list[dict]:
+    """运行完整基准测试矩阵。
+
+    对每对 (prompt_len, gen_len) 组合：
+      1. 随机生成 prompt token IDs（seed=42 保证可复现）
+      2. 安全检查：prompt+gen 不超出 context_length
+      3. 预热：各跑 warmup_runs 次短生成（8 token），消除冷启动
+      4. 正式测试：各跑 bench_runs 次完整生成，记录每次耗时
+      5. 计算平均值 + 加速比 + 吞吐量
+
+    Args:
+        model:          已加载的模型
+        prompt_lengths: 要测试的 prompt 长度列表
+        gen_lengths:    要测试的生成长度列表
+        vocab_size:     模型词表大小（用于随机生成 token）
+        warmup_runs:    预热次数
+        bench_runs:     正式测试次数
+        device:         "cuda" 或 "cpu"
+
+    Returns:
+        结果列表，每个元素为一个 dict，包含 prompt_len, gen_len,
+        no_cache_time_s, cache_total_time_s, speedup 等字段
+    """
     results = []
 
     for prompt_len in prompt_lengths:
@@ -180,12 +271,12 @@ def run_benchmark(
             if prompt_len + gen_len > model.context_length:
                 continue
 
-            # Warmup
+            # ---- 预热：消除 GPU 冷启动抖动 ----
             for _ in range(warmup_runs):
                 generate_no_cache(model, prompt_ids.clone(), min(gen_len, 8))
                 generate_with_cache(model, prompt_ids.clone(), min(gen_len, 8))
 
-            # Benchmark runs
+            # ---- 正式测试：记录每次耗时 ----
             no_cache_times = []
             cache_times = []
             cache_prefill_times = []
@@ -240,6 +331,15 @@ def run_benchmark(
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """基准测试主入口。
+
+    流程：
+      1. 解析参数 + 加载模型
+      2. 定义测试矩阵（5 prompt × 4 gen = 20 组）
+      3. 运行 benchmark
+      4. 保存 CSV + JSON 结果
+      5. 打印汇总统计（平均加速比、decode 吞吐量）
+    """
     args = parse_args()
     dtype_map = {"float32": torch.float32, "float16": torch.float16}
     dtype = dtype_map[args.dtype]
